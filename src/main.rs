@@ -1,3 +1,15 @@
+#![warn(
+    clippy::pedantic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unused_async
+)]
+
+// allow expect
+#![allow(clippy::expect_used)]
+
+
 use std::{borrow::Cow, collections::HashMap};
 
 use aws_sdk_ec2 as ec2;
@@ -40,7 +52,7 @@ struct InstanceItem {
 
 impl From<Instance> for InstanceItem {
     fn from(val: Instance) -> Self {
-        InstanceItem {
+        Self {
             instance: val,
             name_rule: NameRule::InstanceID,
         }
@@ -51,14 +63,14 @@ impl SkimItem for InstanceItem {
     fn text(&self) -> Cow<str> {
         match &self.name_rule {
             NameRule::Tag(tag) => {
-                let tags = self.instance.tags.as_ref().unwrap();
+                let tags = self.instance.tags.as_ref().expect("instance has no tags");
                 let name = tags
                     .iter()
-                    .find(|t| t.key.as_ref().unwrap() == tag)
-                    .unwrap()
+                    .find(|t| t.key == Some(tag.to_string()))
+                    .expect("tag for name not found")
                     .value
                     .as_ref()
-                    .unwrap();
+                    .expect("tag for name has no value");
                 Cow::from(name)
             }
             NameRule::Host => Cow::from(match self.instance.public_dns_name {
@@ -79,26 +91,13 @@ impl SkimItem for InstanceItem {
         AnsiString::from(context)
     }
 
-    fn output(&self) -> Cow<str> {
-        self.instance
-            .instance_id
-            .as_ref()
-            .unwrap()
-            .to_string()
-            .into()
-    }
-
-    fn get_matching_ranges(&self) -> Option<&[(usize, usize)]> {
-        None
-    }
-
     fn preview(&self, _context: PreviewContext) -> ItemPreview {
-        let instance_type = self.instance.instance_type.as_ref().unwrap();
+        let instance_type = self.instance.instance_type.as_ref().expect("instance has no type");
         let instance_state = self
             .instance
             .state
             .as_ref()
-            .unwrap()
+            .expect("instance has no state")
             .name
             .as_ref()
             .expect("instance state name")
@@ -110,9 +109,9 @@ impl SkimItem for InstanceItem {
             .expect("instance tags")
             .iter()
             .map(|t| {
-                (
-                    t.key.as_ref().unwrap().to_string(),
-                    t.value.as_ref().unwrap().to_string(),
+                return (
+                    t.key.as_ref().expect("tag key").to_string(),
+                    t.value.as_ref().expect("tag value").to_string(),
                 )
             })
             .collect();
@@ -138,8 +137,21 @@ impl SkimItem for InstanceItem {
             "private_dns_name":  self.instance.private_dns_name.as_ref(),
             "tags": tags
         });
-        let s = to_colored_json_auto(&val).unwrap();
+        let s = to_colored_json_auto(&val).unwrap_or_else(|_| "".to_string());
         ItemPreview::AnsiText(s)
+    }
+
+    fn output(&self) -> Cow<str> {
+        return self.instance
+            .instance_id
+            .as_ref()
+            .expect("instance has no id")
+            .to_string()
+            .into()
+    }
+
+    fn get_matching_ranges(&self) -> Option<&[(usize, usize)]> {
+        None
     }
 }
 
@@ -153,14 +165,14 @@ async fn main() -> Result<()> {
         .preview(Some("true"))
         .preview_window(Some("right:70%"))
         .build()
-        .unwrap();
+        .expect("failed to build skim options");
 
     let (s, r) = unbounded();
 
     thread::spawn(move || {
         for item in instances {
             let x: Arc<dyn SkimItem> = Arc::new(item.clone());
-            s.send(x).unwrap();
+            s.send(x).expect("failed to send item");
         }
     });
 
@@ -201,7 +213,7 @@ async fn get_instances(args: &Args) -> Result<Vec<InstanceItem>> {
     let client = ec2::Client::new(&config);
 
     let mut instances_query = client.describe_instances();
-    for f in args.filters.iter() {
+    for f in &args.filters {
         let filter = ec2::model::Filter::builder();
         instances_query = instances_query.filters(
             match f.split_once('=') {
@@ -217,7 +229,7 @@ async fn get_instances(args: &Args) -> Result<Vec<InstanceItem>> {
         .ok_or_else(|| eyre!("no reservations"))?;
     let instances: Vec<InstanceItem> = reservations
         .iter()
-        .flat_map(|r| r.instances().unwrap().iter().cloned())
+        .flat_map(|r| r.instances().expect("instances").iter().cloned())
         .map(|i| {
             let mut item: InstanceItem = i.into();
             if args.name_host {
