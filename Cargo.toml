@@ -16,3 +16,5 @@ crossbeam = "^0.8.2"
 colored_json = "3.0.1"
 serde_json = { version = "1.0.64", features = ["preserve_order"] }
 shell-escape = "*"
+chrono = "*"
+chrono-humanize = "*"

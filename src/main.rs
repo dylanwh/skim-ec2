@@ -101,21 +101,39 @@ impl SkimItem for InstanceItem {
             .unwrap()
             .name
             .as_ref()
-            .unwrap()
+            .expect("instance state name")
             .as_str();
         let tags: HashMap<String, String> = self
             .instance
             .tags
             .as_ref()
-            .unwrap()
+            .expect("instance tags")
             .iter()
-            .map(|t| (t.key.as_ref().unwrap().to_string(), t.value.as_ref().unwrap().to_string()))
+            .map(|t| {
+                (
+                    t.key.as_ref().unwrap().to_string(),
+                    t.value.as_ref().unwrap().to_string(),
+                )
+            })
             .collect();
 
+        let uptime = match self.instance.launch_time {
+            Some(ref x) => {
+                let secs = x.secs();
+                let now = chrono::Utc::now().timestamp();
+                let uptime = secs - now;
+                let uptime = chrono::Duration::seconds(uptime);
+                let uptime = chrono_humanize::HumanTime::from(uptime);
+                format!("{}", uptime)
+            }
+            None => "".to_string(),
+        };
+
         let val: Value = json!({
-            "instance_id":  self.instance.instance_id.as_ref().unwrap(),
+            "instance_id":  self.instance.instance_id.as_ref().expect("instance id"),
             "instance_type": instance_type.as_str(),
             "state": instance_state,
+            "uptime": uptime,
             "public_dns_name": self.instance.public_dns_name.as_ref(),
             "private_dns_name":  self.instance.private_dns_name.as_ref(),
             "tags": tags
@@ -130,10 +148,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let instances = get_instances(&args).await?;
     let options = SkimOptionsBuilder::default()
-        .height(Some("50%"))
+        .height(Some("100%"))
         .multi(false)
         .preview(Some("true"))
-        .preview_window(Some("right:80%"))
+        .preview_window(Some("right:70%"))
         .build()
         .unwrap();
 
@@ -146,16 +164,17 @@ async fn main() -> Result<()> {
         }
     });
 
-    let instance_id = Skim::run_with(&options, Some(r))
-        .map(|out| out.selected_items)
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| item.output().to_string())
-                .collect::<Vec<String>>()
-        })
-        .and_then(|ids| ids.first().map(String::to_string))
-        .ok_or_else(|| eyre!("No instance selected"))?;
+    let output = Skim::run_with(&options, Some(r)).ok_or_else(|| eyre!("No output from skim"))?;
+    let instance_id: String = if output.is_abort {
+        Err(eyre!("skim aborted"))
+    } else {
+        Ok(output
+            .selected_items
+            .first()
+            .expect("selected item")
+            .output()
+            .to_string())
+    }?;
 
     if let Some(cmdline) = args.command {
         let id = shell_escape::escape(std::borrow::Cow::Borrowed(&instance_id));
