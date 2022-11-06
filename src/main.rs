@@ -5,27 +5,22 @@
     clippy::panic,
     clippy::unused_async
 )]
-
 // allow expect
 #![allow(clippy::expect_used)]
 
-
-use std::{borrow::Cow, collections::HashMap};
-
 use aws_sdk_ec2 as ec2;
+use clap::Parser;
 use colored_json::to_colored_json_auto;
-use ec2::model::Instance;
+use ec2::{model::Instance, Client};
 use eyre::{eyre, Result};
 use serde_json::{json, Value};
 use skim::prelude::*;
-use std::thread;
-
-use clap::Parser;
+use std::{borrow::Cow, collections::HashMap};
 
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(short, long, value_name = "NAME=VALUE")]
-    filters: Vec<String>,
+    filter: Vec<String>,
 
     #[arg(short, long, value_name = "NAME")]
     name_tag: Option<String>,
@@ -50,12 +45,27 @@ struct InstanceItem {
     name_rule: NameRule,
 }
 
+#[derive(Debug, Clone)]
+struct ErrorItem {
+    message: String,
+}
+
 impl From<Instance> for InstanceItem {
     fn from(val: Instance) -> Self {
         Self {
             instance: val,
             name_rule: NameRule::InstanceID,
         }
+    }
+}
+
+impl SkimItem for ErrorItem {
+    fn text(&self) -> Cow<str> {
+        Cow::from("error")
+    }
+
+    fn preview(&self, _context: PreviewContext) -> ItemPreview {
+        ItemPreview::Text(self.message.clone())
     }
 }
 
@@ -92,7 +102,11 @@ impl SkimItem for InstanceItem {
     }
 
     fn preview(&self, _context: PreviewContext) -> ItemPreview {
-        let instance_type = self.instance.instance_type.as_ref().expect("instance has no type");
+        let instance_type = self
+            .instance
+            .instance_type
+            .as_ref()
+            .expect("instance has no type");
         let instance_state = self
             .instance
             .state
@@ -112,7 +126,7 @@ impl SkimItem for InstanceItem {
                 return (
                     t.key.as_ref().expect("tag key").to_string(),
                     t.value.as_ref().expect("tag value").to_string(),
-                )
+                );
             })
             .collect();
 
@@ -125,7 +139,7 @@ impl SkimItem for InstanceItem {
                 let uptime = chrono_humanize::HumanTime::from(uptime);
                 format!("{}", uptime)
             }
-            None => "".to_string(),
+            None => String::new(),
         };
 
         let val: Value = json!({
@@ -137,17 +151,18 @@ impl SkimItem for InstanceItem {
             "private_dns_name":  self.instance.private_dns_name.as_ref(),
             "tags": tags
         });
-        let s = to_colored_json_auto(&val).unwrap_or_else(|_| "".to_string());
+        let s = to_colored_json_auto(&val).unwrap_or_else(|_| String::new());
         ItemPreview::AnsiText(s)
     }
 
     fn output(&self) -> Cow<str> {
-        return self.instance
+        return self
+            .instance
             .instance_id
             .as_ref()
             .expect("instance has no id")
             .to_string()
-            .into()
+            .into();
     }
 
     fn get_matching_ranges(&self) -> Option<&[(usize, usize)]> {
@@ -158,7 +173,13 @@ impl SkimItem for InstanceItem {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let instances = get_instances(&args).await?;
+
+    let config = aws_config::load_from_env().await;
+    // verify credentials
+    let _ = config.credentials_provider();
+
+    let client = ec2::Client::new(&config);
+
     let options = SkimOptionsBuilder::default()
         .height(Some("100%"))
         .multi(false)
@@ -167,14 +188,8 @@ async fn main() -> Result<()> {
         .build()
         .expect("failed to build skim options");
 
-    let (s, r) = unbounded();
-
-    thread::spawn(move || {
-        for item in instances {
-            let x: Arc<dyn SkimItem> = Arc::new(item.clone());
-            s.send(x).expect("failed to send item");
-        }
-    });
+    let args = Arc::new(args);
+    let r = get_instances_background(Arc::new(client), args.clone()).await;
 
     let output = Skim::run_with(&options, Some(r)).ok_or_else(|| eyre!("No output from skim"))?;
     let instance_id: String = if output.is_abort {
@@ -188,7 +203,7 @@ async fn main() -> Result<()> {
             .to_string())
     }?;
 
-    if let Some(cmdline) = args.command {
+    if let Some(cmdline) = args.command.as_ref() {
         let id = shell_escape::escape(std::borrow::Cow::Borrowed(&instance_id));
         let cmdline = if cmdline.contains("{}") {
             cmdline.replace("{}", &id)
@@ -208,12 +223,34 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn get_instances(args: &Args) -> Result<Vec<InstanceItem>> {
-    let config = aws_config::load_from_env().await;
-    let client = ec2::Client::new(&config);
+async fn get_instances_background(
+    client: Arc<Client>,
+    args: Arc<Args>,
+) -> SkimItemReceiver {
+    let (s, r) = unbounded();
+    tokio::spawn(async move {
+        match get_instances(&client, &args).await {
+            Ok(instances) => {
+                for item in instances {
+                    let x: Arc<dyn SkimItem> = Arc::new(item.clone());
+                    s.send(x).expect("send error");
+                }
+            }
+            Err(msg) => {
+                let x: Arc<dyn SkimItem> = Arc::new(ErrorItem {
+                    message: format!("{}", msg),
+                });
+                s.send(x).expect("send error");
+            }
+        }
+    });
 
+    r
+}
+
+async fn get_instances(client: &Client, args: &Args) -> Result<Vec<InstanceItem>> {
     let mut instances_query = client.describe_instances();
-    for f in &args.filters {
+    for f in &args.filter {
         let filter = ec2::model::Filter::builder();
         instances_query = instances_query.filters(
             match f.split_once('=') {
