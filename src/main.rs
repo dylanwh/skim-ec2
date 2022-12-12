@@ -15,8 +15,7 @@ use ec2::{model::Instance, Client};
 use eyre::{eyre, Result};
 use serde_json::{json, Value};
 use skim::prelude::*;
-use std::os::unix::process::CommandExt;
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, os::unix::process::CommandExt};
 
 #[derive(Parser, Debug)]
 struct Args {
