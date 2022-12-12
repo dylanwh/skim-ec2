@@ -15,10 +15,14 @@ use ec2::{model::Instance, Client};
 use eyre::{eyre, Result};
 use serde_json::{json, Value};
 use skim::prelude::*;
+use std::os::unix::process::CommandExt;
 use std::{borrow::Cow, collections::HashMap};
 
 #[derive(Parser, Debug)]
 struct Args {
+    #[arg(short, long, value_name = "PROFILE")]
+    profile: Option<String>,
+
     #[arg(short, long, value_name = "NAME=VALUE")]
     filter: Vec<String>,
 
@@ -28,13 +32,16 @@ struct Args {
     #[arg(long)]
     name_host: bool,
 
+    #[arg(long)]
+    name_id: bool,
+
     #[arg(short, long, value_name = "COMMAND")]
     command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 enum NameRule {
-    Tag(String),
+    Tag(Box<String>),
     Host,
     InstanceID,
 }
@@ -42,7 +49,7 @@ enum NameRule {
 #[derive(Debug, Clone)]
 struct InstanceItem {
     instance: Instance,
-    name_rule: NameRule,
+    name_rule: Box<NameRule>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,11 +57,11 @@ struct ErrorItem {
     message: String,
 }
 
-impl From<Instance> for InstanceItem {
+impl<'a> From<Instance> for InstanceItem {
     fn from(val: Instance) -> Self {
         Self {
             instance: val,
-            name_rule: NameRule::InstanceID,
+            name_rule: Box::new(NameRule::InstanceID),
         }
     }
 }
@@ -71,8 +78,8 @@ impl SkimItem for ErrorItem {
 
 impl SkimItem for InstanceItem {
     fn text(&self) -> Cow<str> {
-        match &self.name_rule {
-            NameRule::Tag(tag) => {
+        match *self.name_rule {
+            NameRule::Tag(ref tag) => {
                 let tags = self.instance.tags.as_ref().expect("instance has no tags");
                 let name = tags
                     .iter()
@@ -172,7 +179,15 @@ impl SkimItem for InstanceItem {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    if args.filter.is_empty() {
+        args.filter.push("instance-state-name=running".to_string());
+    }
+
+    if let Some(ref profile) = args.profile {
+        std::env::set_var("AWS_PROFILE", profile);
+    }
 
     let config = aws_config::load_from_env().await;
     // verify credentials
@@ -210,23 +225,16 @@ async fn main() -> Result<()> {
         } else {
             format!("{} {}", cmdline, id)
         };
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmdline)
-            .status()?;
-        if !status.success() {
-            return Err(eyre!("Command failed"));
-        }
+        let mut cmd = std::process::Command::new("sh");
+        let err = cmd.arg("-c").arg(cmdline).exec();
+        Err(eyre!("failed to exec command: {}", err))
     } else {
         println!("{}", instance_id);
+        Ok(())
     }
-    Ok(())
 }
 
-async fn get_instances_background(
-    client: Arc<Client>,
-    args: Arc<Args>,
-) -> SkimItemReceiver {
+async fn get_instances_background(client: Arc<Client>, args: Arc<Args>) -> SkimItemReceiver {
     let (s, r) = unbounded();
     tokio::spawn(async move {
         match get_instances(&client, &args).await {
@@ -264,17 +272,23 @@ async fn get_instances(client: &Client, args: &Args) -> Result<Vec<InstanceItem>
     let reservations = output
         .reservations()
         .ok_or_else(|| eyre!("no reservations"))?;
+
+    let name_rule: Box<NameRule> = Box::new(if let Some(ref tag) = args.name_tag {
+        NameRule::Tag(Box::new(tag.to_string()))
+    } else if args.name_host {
+        NameRule::Host
+    } else if args.name_id {
+        NameRule::InstanceID
+    } else {
+        NameRule::Tag(Box::new("Name".to_string()))
+    });
+
     let instances: Vec<InstanceItem> = reservations
         .iter()
         .flat_map(|r| r.instances().expect("instances").iter().cloned())
         .map(|i| {
             let mut item: InstanceItem = i.into();
-            if args.name_host {
-                item.name_rule = NameRule::Host;
-            }
-            if let Some(ref tag) = args.name_tag {
-                item.name_rule = NameRule::Tag(tag.to_string());
-            }
+            item.name_rule = name_rule.clone();
             item
         })
         .collect();
