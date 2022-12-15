@@ -19,18 +19,28 @@ use std::{borrow::Cow, collections::HashMap, os::unix::process::CommandExt};
 
 #[derive(Parser, Debug)]
 struct Args {
+
+    /// Overrides the AWS_PROFILE environment variable
     #[arg(short, long, value_name = "PROFILE")]
     profile: Option<String>,
 
+    /// standard aws filters
     #[arg(short, long, value_name = "NAME=VALUE")]
     filter: Vec<String>,
 
+    /// shortcut to filter by tag
+    #[arg(short, long, value_name = "NAME=VALUE")]
+    tag: Vec<String>,
+
+    /// Use the given tag NAME as the display name for the instance
     #[arg(short, long, value_name = "NAME")]
     name_tag: Option<String>,
 
+    /// Use the hostname as the display name for the instance
     #[arg(long)]
     name_host: bool,
 
+    /// Use the instance id as the display name for the instance
     #[arg(long)]
     name_id: bool,
 
@@ -40,7 +50,7 @@ struct Args {
 
 #[derive(Debug, Clone)]
 enum NameRule {
-    Tag(Box<String>),
+    Tag(String),
     Host,
     InstanceID,
 }
@@ -51,32 +61,8 @@ struct InstanceItem {
     name_rule: Box<NameRule>,
 }
 
-#[derive(Debug, Clone)]
-struct ErrorItem {
-    message: String,
-}
-
-impl<'a> From<Instance> for InstanceItem {
-    fn from(val: Instance) -> Self {
-        Self {
-            instance: val,
-            name_rule: Box::new(NameRule::InstanceID),
-        }
-    }
-}
-
-impl SkimItem for ErrorItem {
-    fn text(&self) -> Cow<str> {
-        Cow::from("error")
-    }
-
-    fn preview(&self, _context: PreviewContext) -> ItemPreview {
-        ItemPreview::Text(self.message.clone())
-    }
-}
-
-impl SkimItem for InstanceItem {
-    fn text(&self) -> Cow<str> {
+impl InstanceItem {
+    fn name(&self) -> Cow<str> {
         match *self.name_rule {
             NameRule::Tag(ref tag) => {
                 let tags = self.instance.tags.as_ref().expect("instance has no tags");
@@ -101,6 +87,37 @@ impl SkimItem for InstanceItem {
                 None => "",
             }),
         }
+
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ErrorItem {
+    message: String,
+}
+
+impl From<Instance> for InstanceItem {
+    fn from(val: Instance) -> Self {
+        Self {
+            instance: val,
+            name_rule: Box::new(NameRule::InstanceID),
+        }
+    }
+}
+
+impl SkimItem for ErrorItem {
+    fn text(&self) -> Cow<str> {
+        Cow::from("error")
+    }
+
+    fn preview(&self, _context: PreviewContext) -> ItemPreview {
+        ItemPreview::Text(self.message.clone())
+    }
+}
+
+impl SkimItem for InstanceItem {
+    fn text(&self) -> Cow<str> {
+        self.name()
     }
 
     fn display<'a>(&'a self, context: DisplayContext<'a>) -> AnsiString<'a> {
@@ -237,7 +254,9 @@ async fn get_instances_background(client: Arc<Client>, args: Arc<Args>) -> SkimI
     let (s, r) = unbounded();
     tokio::spawn(async move {
         match get_instances(&client, &args).await {
-            Ok(instances) => {
+            Ok(mut instances) => {
+                instances.sort_by(|a, b| a.name().cmp(&b.name()));
+
                 for item in instances {
                     let x: Arc<dyn SkimItem> = Arc::new(item.clone());
                     s.send(x).expect("send error");
@@ -273,13 +292,13 @@ async fn get_instances(client: &Client, args: &Args) -> Result<Vec<InstanceItem>
         .ok_or_else(|| eyre!("no reservations"))?;
 
     let name_rule: Box<NameRule> = Box::new(if let Some(ref tag) = args.name_tag {
-        NameRule::Tag(Box::new(tag.to_string()))
+        NameRule::Tag(tag.to_string())
     } else if args.name_host {
         NameRule::Host
     } else if args.name_id {
         NameRule::InstanceID
     } else {
-        NameRule::Tag(Box::new("Name".to_string()))
+        NameRule::Tag("Name".to_string())
     });
 
     let instances: Vec<InstanceItem> = reservations
