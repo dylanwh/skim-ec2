@@ -18,3 +18,4 @@ serde_json = { version = "1.0.64", features = ["preserve_order"] }
 shell-escape = "*"
 chrono = "*"
 chrono-humanize = "*"
+serde = { version = "1.0.130", features = ["derive"] }

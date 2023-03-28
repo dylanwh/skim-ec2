@@ -24,6 +24,10 @@ struct Args {
     #[arg(short, long, value_name = "PROFILE")]
     profile: Option<String>,
 
+    /// Overrides the AWS_REGION environment variable
+    #[arg(short, long, value_name = "REGION")]
+    region: Option<String>,
+
     /// standard aws filters
     #[arg(short, long, value_name = "NAME=VALUE")]
     filter: Vec<String>,
@@ -44,8 +48,8 @@ struct Args {
     #[arg(long)]
     name_id: bool,
 
-    #[arg(short, long, value_name = "COMMAND")]
-    command: Option<String>,
+    #[arg(short, long, value_name = "COMMAND", default_value = "aws ssm start-session --target {}")]
+    command: String,
 }
 
 #[derive(Debug, Clone)]
@@ -160,7 +164,7 @@ impl SkimItem for InstanceItem {
                 let uptime = secs - now;
                 let uptime = chrono::Duration::seconds(uptime);
                 let uptime = chrono_humanize::HumanTime::from(uptime);
-                format!("{}", uptime)
+                format!("{uptime}")
             }
             None => String::new(),
         };
@@ -204,6 +208,9 @@ async fn main() -> Result<()> {
     if let Some(ref profile) = args.profile {
         std::env::set_var("AWS_PROFILE", profile);
     }
+    if let Some(ref region) = args.region {
+        std::env::set_var("AWS_REGION", region);
+    }
 
     let config = aws_config::load_from_env().await;
     // verify credentials
@@ -234,20 +241,16 @@ async fn main() -> Result<()> {
             .to_string())
     }?;
 
-    if let Some(cmdline) = args.command.as_ref() {
-        let id = shell_escape::escape(std::borrow::Cow::Borrowed(&instance_id));
-        let cmdline = if cmdline.contains("{}") {
-            cmdline.replace("{}", &id)
-        } else {
-            format!("{} {}", cmdline, id)
-        };
-        let mut cmd = std::process::Command::new("sh");
-        let err = cmd.arg("-c").arg(cmdline).exec();
-        Err(eyre!("failed to exec command: {}", err))
+    let cmdline = args.command.clone();
+    let id = shell_escape::escape(std::borrow::Cow::Borrowed(&instance_id));
+    let cmdline = if cmdline.contains("{}") {
+        cmdline.replace("{}", &id)
     } else {
-        println!("{}", instance_id);
-        Ok(())
-    }
+        format!("{cmdline} {id}")
+    };
+    let mut cmd = std::process::Command::new("sh");
+    let err = cmd.arg("-c").arg(cmdline).exec();
+    Err(eyre!("failed to exec command: {}", err))
 }
 
 async fn get_instances_background(client: Arc<Client>, args: Arc<Args>) -> SkimItemReceiver {
@@ -264,7 +267,7 @@ async fn get_instances_background(client: Arc<Client>, args: Arc<Args>) -> SkimI
             }
             Err(msg) => {
                 let x: Arc<dyn SkimItem> = Arc::new(ErrorItem {
-                    message: format!("{}", msg),
+                    message: format!("{msg}"),
                 });
                 s.send(x).expect("send error");
             }
