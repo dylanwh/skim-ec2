@@ -73,10 +73,9 @@ impl InstanceItem {
                 let name = tags
                     .iter()
                     .find(|t| t.key == Some(tag.to_string()))
-                    .expect("tag for name not found")
-                    .value
-                    .as_ref()
-                    .expect("tag for name has no value");
+                    .and_then(|t| t.value.as_ref())
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| format!("notag-{}", self.instance.instance_id.as_ref().expect("instance id")));
                 Cow::from(name)
             }
             NameRule::Host => Cow::from(match self.instance.public_dns_name {
